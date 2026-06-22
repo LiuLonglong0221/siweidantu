@@ -1,0 +1,856 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="theme-color" content="#0f0f1a" />
+  <title>思维导图 - MindMap</title>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            primary: '#1a1a2e', secondary: '#2d2d44',
+            accent: '#ff6b6b', mint: '#4ecdc4', dark: '#0f0f1a'
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    * { -webkit-tap-highlight-color: transparent; }
+    body { font-family: 'Segoe UI', system-ui, sans-serif; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+    .animate-fade-in { animation: fadeIn 0.3s ease-out forwards; }
+    @keyframes slideUp { from { opacity: 0; transform: translateY(100%); } to { opacity: 1; transform: translateY(0); } }
+    .animate-slide-up { animation: slideUp 0.3s ease-out forwards; }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: #1a1a2e; }
+    ::-webkit-scrollbar-thumb { background: #4ecdc4; border-radius: 3px; }
+  </style>
+</head>
+<body class="bg-dark text-white min-h-screen">
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef, useMemo, useCallback, createContext, useContext } = React;
+
+// ============ Storage ============
+function makeId(prefix = 'id') {
+  return prefix + '_' + Math.random().toString(36).substring(2, 11) + Date.now().toString(36).substring(4,8);
+}
+
+function getMindmaps() {
+  try { return JSON.parse(localStorage.getItem('mm_mindmaps') || '[]'); }
+  catch { return []; }
+}
+
+function saveMindmaps(list) {
+  localStorage.setItem('mm_mindmaps', JSON.stringify(list));
+}
+
+function getFolders() {
+  try { return JSON.parse(localStorage.getItem('mm_folders') || '[]'); }
+  catch { return []; }
+}
+
+function saveFolders(list) {
+  localStorage.setItem('mm_folders', JSON.stringify(list));
+}
+
+// ============ Store ============
+function createStore() {
+  let state = {
+    mindmaps: getMindmaps(),
+    folders: getFolders(),
+    currentMindmap: null,
+    isEditing: false,
+    nodesMap: {},
+    rootId: null,
+    view: 'home', // 'home' | 'editor'
+  };
+  const listeners = new Set();
+  const notify = () => listeners.forEach(fn => fn(state));
+
+  return {
+    getState: () => state,
+    setState: (updater) => {
+      state = typeof updater === 'function' ? updater(state) : { ...state, ...updater };
+      notify();
+    },
+    subscribe: (fn) => { listeners.add(fn); return () => listeners.delete(fn); }
+  };
+}
+
+const store = createStore();
+
+function useStore() {
+  const [, forceUpdate] = useState(0);
+  const callback = useCallback(() => forceUpdate(n => n + 1), []);
+  useEffect(() => {
+    const unsub = store.subscribe(callback);
+    return unsub;
+  }, [callback]);
+  return store.getState();
+}
+
+function buildTree(nodes) {
+  const map = {};
+  const roots = [];
+  nodes.forEach(n => { map[n.id] = { ...n, children: [] }; });
+  nodes.forEach(n => {
+    if (n.parent_id && map[n.parent_id]) map[n.parent_id].children.push(map[n.id]);
+    else roots.push(map[n.id]);
+  });
+  return { map, roots };
+}
+
+function flattenTree(root, parentId = null, out = []) {
+  out.push({ id: root.id, text: root.text, parent_id: parentId });
+  if (root.children) root.children.forEach(c => flattenTree(c, root.id, out));
+  return out;
+}
+
+// ============ Layout ============
+const NODE_W = 160, NODE_H = 50, HGAP = 90, VGAP = 30, PAD = 40;
+
+function layoutTree(root) {
+  if (!root) return { positions: {}, connections: [], width: 600, height: 300 };
+
+  const positions = {}, connections = [];
+
+  function subH(node) {
+    if (!node.children || node.children.length === 0) return NODE_H;
+    const gaps = (node.children.length - 1) * VGAP;
+    const childH = node.children.reduce((s, c) => s + subH(c), 0);
+    return Math.max(NODE_H, gaps + childH);
+  }
+
+  function place(node, x, yTop) {
+    const h = subH(node);
+    const y = yTop + h / 2 - NODE_H / 2;
+    positions[node.id] = { x, y };
+    if (node.children && node.children.length > 0) {
+      let cy = yTop;
+      const cx = x + NODE_W + HGAP;
+      node.children.forEach(child => {
+        const ch = subH(child);
+        place(child, cx, cy);
+        connections.push({
+          from: { x: x + NODE_W, y: yTop + h / 2 },
+          to: { x: cx, y: cy + ch / 2 }
+        });
+        cy += ch + VGAP;
+      });
+    }
+  }
+
+  const totalH = subH(root);
+  place(root, PAD, PAD);
+  const maxX = Math.max(...Object.values(positions).map(p => p.x), PAD);
+  return { positions, connections, width: maxX + NODE_W + PAD * 2, height: Math.max(totalH + PAD * 2, 400) };
+}
+
+function getLevel(id, map) {
+  let lvl = 0, cur = map[id];
+  while (cur && cur.parent_id) { lvl++; cur = map[cur.parent_id]; }
+  return lvl;
+}
+
+// ============ Components ============
+
+function NodeComponent({ node, level, onEdit, onAddChild, onAddSibling, onDelete, isEditing }) {
+  const [editing, setEditing] = useState(false);
+  const [text, setText] = useState(node.text);
+
+  useEffect(() => { setText(node.text); }, [node.text]);
+
+  const gradColors = [
+    'from-mint to-accent', 'from-accent to-mint',
+    'from-yellow-400 to-orange-400', 'from-blue-500 to-purple-500'
+  ];
+  const grad = gradColors[level % gradColors.length];
+
+  function handleDoubleClick(e) {
+    e.stopPropagation();
+    if (!isEditing) return;
+    setEditing(true);
+    setText(node.text);
+  }
+
+  function handleBlur() {
+    setEditing(false);
+    if (text.trim() && text !== node.text) onEdit(node.id, text.trim());
+  }
+
+  function handleKey(e) {
+    if (e.key === 'Enter') handleBlur();
+    if (e.key === 'Escape') { setEditing(false); setText(node.text); }
+  }
+
+  return (
+    <div className="relative h-full" onPointerDown={e => e.stopPropagation()}>
+      <div
+        className={`absolute inset-0 bg-secondary rounded-xl px-3 py-2 flex items-center justify-center shadow-md transition-all
+          ${isEditing ? 'hover:ring-2 hover:ring-mint cursor-pointer' : ''}
+          ${editing ? 'ring-2 ring-accent' : ''}`}
+        onDoubleClick={handleDoubleClick}
+      >
+        {level === 0 && (
+          <div className={`absolute -inset-[3px] rounded-xl bg-gradient-to-r ${grad} -z-10 opacity-80`} />
+        )}
+        {editing ? (
+          <input
+            autoFocus className="bg-transparent text-center text-sm text-white outline-none w-full"
+            value={text} onChange={e => setText(e.target.value)}
+            onBlur={handleBlur} onKeyDown={handleKey}
+          />
+        ) : (
+          <span className="text-sm text-center break-words truncate w-full">{node.text}</span>
+        )}
+      </div>
+
+      {isEditing && (
+        <>
+          {/* Right zone - add child */}
+          <div
+            className="absolute no-drag"
+            style={{ right: 0, top: '50%', transform: 'translateY(-50%) translateX(50%)' }}
+            onPointerDown={e => { e.stopPropagation(); }}
+            onClick={e => { e.stopPropagation(); onAddChild(node.id); }}
+            title="添加子节点"
+          >
+            <div className="w-7 h-7 rounded-full bg-mint text-white flex items-center justify-center text-sm font-bold shadow-lg shadow-mint/40 hover:scale-110 transition-transform active:scale-95">+</div>
+          </div>
+          {/* Bottom zone - add sibling (only non-root) */}
+          {level > 0 && (
+            <>
+              <div
+                className="absolute no-drag"
+                style={{ bottom: 0, left: '50%', transform: 'translateX(-50%) translateY(50%)' }}
+                onPointerDown={e => { e.stopPropagation(); }}
+                onClick={e => { e.stopPropagation(); onAddSibling(node.id); }}
+                title="添加兄弟节点"
+              >
+                <div className="w-7 h-7 rounded-full bg-accent text-white flex items-center justify-center text-sm font-bold shadow-lg shadow-accent/40 hover:scale-110 transition-transform active:scale-95">+</div>
+              </div>
+              {/* Left zone - delete (only non-root) */}
+              <div
+                className="absolute no-drag"
+                style={{ left: 0, top: '50%', transform: 'translateY(-50%) translateX(-50%)' }}
+                onPointerDown={e => { e.stopPropagation(); }}
+                onClick={e => { e.stopPropagation(); onDelete(node.id); }}
+                title="删除节点"
+              >
+                <div className="w-7 h-7 rounded-full bg-red-500 text-white flex items-center justify-center text-sm font-bold shadow-lg shadow-red-500/40 hover:scale-110 transition-transform active:scale-95">×</div>
+              </div>
+            </>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+function MindMapCanvas({ mindmap, nodesMap, rootId, isEditing, onUpdateNode, onAddChild, onAddSibling, onDeleteNode }) {
+  const root = rootId ? nodesMap[rootId] : null;
+  const { positions, connections, width, height } = useMemo(
+    () => layoutTree(root), [root, nodesMap, mindmap?.nodes?.length]
+  );
+  const containerRef = useRef(null);
+  const [pan, setPan] = useState({ x: 40, y: 40 });
+  const [scale, setScale] = useState(1);
+  const dragRef = useRef(null);
+  const lastTouchDist = useRef(null);
+  const lastTouchCenter = useRef(null);
+
+  useEffect(() => {
+    if (!containerRef.current || !root || !positions[rootId]) return;
+    const cw = containerRef.current.clientWidth;
+    const ch = containerRef.current.clientHeight;
+    const startX = (cw / 2) - positions[rootId].x - NODE_W / 2;
+    const startY = (ch / 2) - positions[rootId].y - NODE_H / 2;
+    setPan({ x: Math.max(20, startX), y: Math.max(20, startY) });
+  }, [rootId]);
+
+  function getTouchDist(touches) {
+    const dx = touches[0].clientX - touches[1].clientX;
+    const dy = touches[0].clientY - touches[1].clientY;
+    return Math.sqrt(dx * dx + dy * dy);
+  }
+  function getTouchCenter(touches) {
+    return { x: (touches[0].clientX + touches[1].clientX) / 2, y: (touches[0].clientY + touches[1].clientY) / 2 };
+  }
+
+  function onPointerDown(e) {
+    if (e.target.closest('.no-drag')) return;
+    dragRef.current = { sx: e.clientX, sy: e.clientY, px: pan.x, py: pan.y, moved: 0 };
+  }
+  function onPointerMove(e) {
+    if (!dragRef.current) return;
+    const dx = e.clientX - dragRef.current.sx;
+    const dy = e.clientY - dragRef.current.sy;
+    dragRef.current.moved += Math.abs(dx) + Math.abs(dy);
+    if (dragRef.current.moved > 4) {
+      setPan({ x: dragRef.current.px + dx, y: dragRef.current.py + dy });
+    }
+  }
+  function onPointerUp() { dragRef.current = null; lastTouchDist.current = null; lastTouchCenter.current = null; }
+
+  function onTouchStart(e) {
+    if (e.touches.length === 2) {
+      lastTouchDist.current = getTouchDist(e.touches);
+      lastTouchCenter.current = getTouchCenter(e.touches);
+    }
+  }
+  function onTouchMove(e) {
+    e.preventDefault();
+    if (e.touches.length === 2 && lastTouchDist.current !== null) {
+      const newDist = getTouchDist(e.touches);
+      const scaleDelta = newDist / lastTouchDist.current;
+      setScale(s => Math.min(3, Math.max(0.2, s * scaleDelta)));
+      lastTouchDist.current = newDist;
+    }
+  }
+  function onTouchEnd(e) {
+    if (e.touches.length < 2) {
+      lastTouchDist.current = null;
+      lastTouchCenter.current = null;
+    }
+  }
+
+  function onWheel(e) {
+    e.preventDefault();
+    const d = e.deltaY > 0 ? 0.92 : 1.08;
+    setScale(s => Math.min(3, Math.max(0.2, s * d)));
+  }
+
+  if (!root) {
+    return <div className="w-full h-full flex items-center justify-center text-gray-400">暂无节点</div>;
+  }
+
+  return (
+    <div
+      ref={containerRef}
+      className="w-full h-full overflow-auto cursor-grab active:cursor-grabbing select-none"
+      onPointerDown={onPointerDown} onPointerMove={onPointerMove}
+      onPointerUp={onPointerUp} onPointerLeave={onPointerUp}
+      onTouchStart={onTouchStart} onTouchMove={onTouchMove} onTouchEnd={onTouchEnd}
+      onWheel={onWheel} style={{ touchAction: 'none' }}
+    >
+      <div style={{
+        position: 'relative', width: width + 200, height: height + 200,
+        transform: `translate(${pan.x}px, ${pan.y}px) scale(${scale})`,
+        transformOrigin: '0 0'
+      }}>
+        <svg width={width + 200} height={height + 200}
+          style={{ position: 'absolute', top: 0, left: 0, pointerEvents: 'none' }}>
+          <defs>
+            <linearGradient id="lg" x1="0%" y1="0%" x2="100%" y2="0%">
+              <stop offset="0%" stopColor="#4ecdc4" />
+              <stop offset="100%" stopColor="#ff6b6b" />
+            </linearGradient>
+          </defs>
+          {connections.map((c, i) => {
+            const mx = (c.from.x + c.to.x) / 2;
+            const d = `M ${c.from.x} ${c.from.y} C ${mx} ${c.from.y}, ${mx} ${c.to.y}, ${c.to.x} ${c.to.y}`;
+            return <path key={i} d={d} stroke="url(#lg)" strokeWidth="2.5" fill="none" opacity="0.85" strokeLinecap="round" />;
+          })}
+        </svg>
+        {Object.entries(positions).map(([id, pos]) => (
+          <div key={id} style={{ position: 'absolute', left: pos.x, top: pos.y, width: NODE_W, height: NODE_H }}>
+            <NodeComponent
+              node={nodesMap[id]} level={getLevel(id, nodesMap)}
+              isEditing={isEditing}
+              onEdit={onUpdateNode}
+              onAddChild={onAddChild}
+              onAddSibling={onAddSibling}
+              onDelete={onDeleteNode}
+            />
+          </div>
+        ))}
+
+        {/* Zoom controls */}
+        <div className="absolute top-4 right-4 flex flex-col gap-2 z-30">
+          <button onClick={() => setScale(s => Math.min(3, s + 0.15))}
+            className="w-10 h-10 rounded-xl bg-secondary/90 hover:bg-secondary text-white font-bold shadow-lg flex items-center justify-center transition-all active:scale-95 no-drag">
+            +
+          </button>
+          <div className="w-10 h-8 rounded-xl bg-secondary/90 text-white text-xs font-medium flex items-center justify-center no-drag">
+            {Math.round(scale * 100)}%
+          </div>
+          <button onClick={() => setScale(s => Math.max(0.2, s - 0.15))}
+            className="w-10 h-10 rounded-xl bg-secondary/90 hover:bg-secondary text-white font-bold shadow-lg flex items-center justify-center transition-all active:scale-95 no-drag">
+            −
+          </button>
+          <button onClick={() => { setScale(1); setPan({ x: 40, y: 40 }); }}
+            className="w-10 h-10 rounded-xl bg-secondary/90 hover:bg-secondary text-white text-sm font-bold shadow-lg flex items-center justify-center transition-all active:scale-95 no-drag"
+            title="重置视图">
+            ⟲
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function EditorPage({ id, onBack }) {
+  const state = useStore();
+  const mindmap = state.mindmaps.find(m => m.id === id);
+  const [title, setTitle] = useState('');
+  const [isEditing, setIsEditing] = useState(false);
+  const [level, setLevel] = useState(0);
+
+  useEffect(() => {
+    if (!mindmap) return;
+    setTitle(mindmap.title || '');
+    const nodes = mindmap.nodes || [];
+    const { map, roots } = buildTree(nodes);
+    const rootId = roots.length > 0 ? roots[0].id : null;
+    store.setState(s => ({ ...s, currentMindmap: mindmap, nodesMap: map, rootId, isEditing: false }));
+  }, [id]);
+
+  const { nodesMap, rootId } = useStore();
+  const mind = store.getState().currentMindmap;
+
+  function updateNodeText(nodeId, text) {
+    const s = store.getState();
+    const newMap = { ...s.nodesMap, [nodeId]: { ...s.nodesMap[nodeId], text } };
+    const newNodes = (s.currentMindmap?.nodes || []).map(n => n.id === nodeId ? { ...n, text } : n);
+    updateMindmapData({ ...s.currentMindmap, nodes: newNodes });
+    store.setState({ nodesMap: newMap });
+  }
+
+  function addChildNode(parentId) {
+    const s = store.getState();
+    const node = { id: makeId('n'), text: '新节点', parent_id: parentId };
+    const newMap = { ...s.nodesMap };
+    newMap[parentId] = { ...newMap[parentId], children: [...(newMap[parentId].children || []), node] };
+    newMap[node.id] = node;
+    const newNodes = [...(s.currentMindmap?.nodes || []), node];
+    updateMindmapData({ ...s.currentMindmap, nodes: newNodes });
+    store.setState({ nodesMap: newMap });
+  }
+
+  function addSiblingNode(nodeId) {
+    const s = store.getState();
+    const pid = s.nodesMap[nodeId]?.parent_id;
+    if (!pid) return;
+    const node = { id: makeId('n'), text: '新节点', parent_id: pid };
+    const newMap = { ...s.nodesMap };
+    newMap[pid] = { ...newMap[pid], children: [...(newMap[pid].children || []), node] };
+    newMap[node.id] = node;
+    const newNodes = [...(s.currentMindmap?.nodes || []), node];
+    updateMindmapData({ ...s.currentMindmap, nodes: newNodes });
+    store.setState({ nodesMap: newMap });
+  }
+
+  function deleteNode(nodeId) {
+    const s = store.getState();
+    if (nodeId === s.rootId) return;
+    const toDel = new Set();
+    function collect(id) { toDel.add(id); const n = s.nodesMap[id]; if (n?.children) n.children.forEach(c => collect(c.id)); }
+    collect(nodeId);
+    const newMap = {};
+    Object.entries(s.nodesMap).forEach(([id, n]) => {
+      if (!toDel.has(id)) newMap[id] = { ...n, children: (n.children || []).filter(c => !toDel.has(c.id)) };
+    });
+    const parent = Object.values(newMap).find(n => n.children?.some(c => c.id === nodeId));
+    if (parent) parent.children = parent.children.filter(c => c.id !== nodeId);
+    const newNodes = (s.currentMindmap?.nodes || []).filter(n => !toDel.has(n.id));
+    updateMindmapData({ ...s.currentMindmap, nodes: newNodes });
+    store.setState({ nodesMap: newMap });
+  }
+
+  function updateMindmapData(updated) {
+    const mindmaps = store.getState().mindmaps.map(m => m.id === updated.id ? updated : m);
+    store.setState({ mindmaps });
+    saveMindmaps(mindmaps);
+    store.setState({ currentMindmap: updated });
+  }
+
+  function handleTitleChange(newTitle) {
+    setTitle(newTitle);
+    if (!mind) return;
+    const updated = { ...mind, title: newTitle };
+    const mindmaps = store.getState().mindmaps.map(m => m.id === updated.id ? updated : m);
+    store.setState({ mindmaps });
+    saveMindmaps(mindmaps);
+    store.setState({ currentMindmap: updated });
+  }
+
+  function exportMindMap() {
+    if (!mind) return;
+    const dataStr = JSON.stringify({ title: title || mind.title, nodes: mind.nodes });
+
+    function computeLayout(nodes) {
+      const map = {};
+      nodes.forEach(n => map[n.id] = { ...n, children: [] });
+      let root = null;
+      nodes.forEach(n => {
+        if (n.parent_id && map[n.parent_id]) map[n.parent_id].children.push(map[n.id]);
+        else root = map[n.id];
+      });
+      if (!root) return null;
+
+      const NW = 160, NH = 50, HGAP = 90;
+      function subH(node) {
+        if (!node.children || !node.children.length) return NH;
+        return Math.max(NH, node.children.reduce((s, c) => s + subH(c), 0) + (node.children.length - 1) * 30);
+      }
+      const positions = {};
+      const conn = [];
+      function place(node, x, yTop) {
+        const h = subH(node);
+        const y = yTop + h / 2 - NH / 2;
+        positions[node.id] = { x, y };
+        if (node.children && node.children.length) {
+          let cy = yTop;
+          const cx = x + NW + HGAP;
+          node.children.forEach(child => {
+            const ch = subH(child);
+            place(child, cx, cy);
+            conn.push({ from: { x: x + NW, y: yTop + h / 2 }, to: { x: cx, y: cy + ch / 2 } });
+            cy += ch + 30;
+          });
+        }
+      }
+      place(root, 40, 40);
+      const totalW = Math.max(...Object.values(positions).map(p => p.x)) + NW + 80;
+      const totalH = Math.max(subH(root) + 80, 300);
+      let levelMap = {};
+      function markLevel(node, lvl) {
+        levelMap[node.id] = lvl;
+        if (node.children) node.children.forEach(c => markLevel(c, lvl + 1));
+      }
+      markLevel(root, 0);
+      return { positions, conn, width: totalW, height: totalH, rootId: root.id, levelMap, textMap: Object.fromEntries(nodes.map(n => [n.id, n.text])) };
+    }
+
+    const layout = computeLayout(mind.nodes);
+    if (!layout) { alert('没有可导出的节点'); return; }
+
+    const nodeHtml = Object.entries(layout.positions).map(([id, pos]) => {
+      const lvl = layout.levelMap[id];
+      const bg = lvl === 0 ? 'linear-gradient(135deg,#4ecdc4,#ff6b6b)' : '#2d2d44';
+      const shadow = lvl === 0 ? '0 4px 20px rgba(78,205,196,0.4)' : '0 2px 8px rgba(0,0,0,0.3)';
+      return `<div style="position:absolute;left:${pos.x}px;top:${pos.y}px;width:160px;height:50px;background:${bg};border-radius:12px;display:flex;align-items:center;justify-content:center;color:white;font-size:13px;font-weight:500;padding:0 12px;text-align:center;box-shadow:${shadow};box-sizing:border-box;overflow:hidden">${layout.textMap[id] || ''}</div>`;
+    }).join('');
+
+    const svgWidth = layout.width + 200;
+    const svgHeight = layout.height + 200;
+    const paths = layout.conn.map(c => {
+      const mx = (c.from.x + c.to.x) / 2;
+      return `<path d="M ${c.from.x} ${c.from.y} C ${mx} ${c.from.y}, ${mx} ${c.to.y}, ${c.to.x} ${c.to.y}" stroke="url(#grad)" stroke-width="2.5" fill="none" stroke-linecap="round" opacity="0.85" />`;
+    }).join('');
+
+    const exportHtml = `<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title || mind.title || '思维导图'}</title><style>
+body{margin:0;background:#0f0f1a;font-family:system-ui,-apple-system,'Segoe UI',sans-serif;min-height:100vh;color:#fff}
+.header{background:rgba(26,26,46,0.95);backdrop-filter:blur(10px);padding:16px 20px;border-bottom:1px solid #2d2d44;position:sticky;top:0;z-index:10}
+.title{font-size:18px;font-weight:700;background:linear-gradient(90deg,#4ecdc4,#ff6b6b);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+.sub{font-size:12px;color:#888;margin-top:4px}
+.canvas{padding:40px;overflow:auto}
+.tree-wrap{position:relative;width:${svgWidth}px;height:${svgHeight}px;margin:0 auto}
+</style></head><body><div class="header"><div class="title">🧠 ${title || mind.title || '思维导图'}</div><div class="sub">由思维导图应用导出 · ${mind.nodes.length} 个节点</div></div><div class="canvas"><div class="tree-wrap"><svg width="${svgWidth}" height="${svgHeight}" style="position:absolute;top:0;left:0"><defs><linearGradient id="grad" x1="0%" x2="100%" y1="0%" y2="0%"><stop offset="0%" stop-color="#4ecdc4"/><stop offset="100%" stop-color="#ff6b6b"/></linearGradient></defs>${paths}</svg>${nodeHtml}<script type="application/json" id="mindmap-data">${dataStr.replace(/</g, '\\u003c')}</script></div></div></body></html>`;
+
+    const blob = new Blob([exportHtml], { type: 'text/html;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${title || mind.title || '思维导图'}.html`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 100);
+  }
+
+  if (!mindmap) {
+    return <div className="min-h-screen bg-dark flex items-center justify-center">
+      <div className="text-gray-400">加载中...</div>
+    </div>;
+  }
+
+  return (
+    <div className="min-h-screen bg-dark flex flex-col">
+      <div className="sticky top-0 z-20 bg-primary/95 backdrop-blur border-b border-secondary">
+        <div className="max-w-full mx-auto px-3 py-2 flex items-center gap-2">
+          <button onClick={onBack}
+            className="w-10 h-10 flex items-center justify-center rounded-xl bg-secondary hover:bg-secondary/80 transition-colors flex-shrink-0 no-drag">
+            ←
+          </button>
+          <div className="flex-1 min-w-0">
+            <input value={title} onChange={e => handleTitleChange(e.target.value)}
+              className="w-full bg-transparent text-base font-semibold outline-none hover:bg-secondary/30 rounded-lg px-1 py-1" />
+            <p className="text-xs text-gray-400 px-1">
+              {isEditing ? '编辑模式' : '查看模式'} · {(mind?.nodes?.length || 0)} 个节点
+            </p>
+          </div>
+          <button onClick={() => setIsEditing(v => !v)}
+            className={`px-4 py-2 rounded-xl font-medium text-sm transition-all flex-shrink-0 no-drag
+              ${isEditing ? 'bg-gradient-to-r from-mint to-accent text-white' : 'bg-secondary hover:bg-secondary/80 text-white'}`}>
+            {isEditing ? '✓ 完成' : '✎ 编辑'}
+          </button>
+        </div>
+      </div>
+
+      {isEditing && (
+        <div className="bg-mint/10 border-b border-mint/30 text-center py-2 px-4 text-xs text-mint">
+          双击节点编辑文本 · 点击右侧 <span className="text-mint font-bold">+</span> 添加子节点 · 点击下方 <span className="text-accent font-bold">+</span> 添加兄弟节点 · 点击左侧 <span className="text-red-400 font-bold">×</span> 删除
+        </div>
+      )}
+
+      <div className="flex-1 overflow-hidden">
+        <MindMapCanvas
+          mindmap={mind}
+          nodesMap={nodesMap}
+          rootId={rootId}
+          isEditing={isEditing}
+          onUpdateNode={updateNodeText}
+          onAddChild={addChildNode}
+          onAddSibling={addSiblingNode}
+          onDeleteNode={deleteNode}
+        />
+      </div>
+    </div>
+  );
+}
+
+function HomePage({ onOpen }) {
+  const [folders, setFolders] = useState([]);
+  const [mindmaps, setMindmaps] = useState([]);
+  const [expanded, setExpanded] = useState(new Set());
+  const [showFolderModal, setShowFolderModal] = useState(false);
+  const [showMapModal, setShowMapModal] = useState(false);
+  const [newName, setNewName] = useState('');
+  const [selFolder, setSelFolder] = useState(null);
+  const [editingFolder, setEditingFolder] = useState(null);
+  const [editName, setEditName] = useState('');
+
+  useEffect(() => {
+    setFolders(getFolders());
+    setMindmaps(getMindmaps());
+  }, []);
+
+  function toggleFolder(id) {
+    setExpanded(prev => { const s = new Set(prev); s.has(id) ? s.delete(id) : s.add(id); return s; });
+  }
+
+  function createFolder() {
+    if (!newName.trim()) return;
+    const f = { id: makeId('f'), name: newName.trim(), created_at: Date.now(), updated_at: Date.now() };
+    const list = [...folders, f];
+    setFolders(list); saveFolders(list);
+    setNewName(''); setShowFolderModal(false);
+  }
+
+  function createMindmap() {
+    if (!newName.trim()) return;
+    const rootId = makeId('n');
+    const nodes = [
+      { id: rootId, text: newName.trim(), parent_id: null },
+      { id: makeId('n'), text: '分支 1', parent_id: rootId },
+      { id: makeId('n'), text: '分支 2', parent_id: rootId }
+    ];
+    const m = { id: makeId('m'), title: newName.trim(), folder_id: selFolder, nodes, created_at: Date.now(), updated_at: Date.now() };
+    const list = [...mindmaps, m];
+    setMindmaps(list); saveMindmaps(list);
+    setNewName(''); setSelFolder(null); setShowMapModal(false);
+    onOpen(m.id);
+  }
+
+  function deleteFolder(id) {
+    if (!confirm('删除文件夹？里面的思维导图会移至未分类。')) return;
+    const list = folders.filter(f => f.id !== id);
+    setFolders(list); saveFolders(list);
+    const maps = mindmaps.map(m => m.folder_id === id ? { ...m, folder_id: null } : m);
+    setMindmaps(maps); saveMindmaps(maps);
+  }
+
+  function renameFolder(f) {
+    if (editingFolder === f.id) {
+      if (!editName.trim()) { setEditingFolder(null); return; }
+      const list = folders.map(x => x.id === f.id ? { ...x, name: editName.trim(), updated_at: Date.now() } : x);
+      setFolders(list); saveFolders(list);
+      setEditingFolder(null);
+    } else {
+      setEditingFolder(f.id); setEditName(f.name);
+    }
+  }
+
+  const uncategorized = mindmaps.filter(m => !m.folder_id);
+
+  return (
+    <div className="min-h-screen bg-dark">
+      <div className="sticky top-0 z-10 bg-primary/95 backdrop-blur border-b border-secondary">
+        <div className="max-w-md mx-auto px-4 py-4">
+          <h1 className="text-xl font-bold bg-gradient-to-r from-mint to-accent bg-clip-text text-transparent">
+            🧠 思维导图
+          </h1>
+          <p className="text-xs text-gray-400 mt-0.5">轻松创建 · 永久保存</p>
+        </div>
+      </div>
+
+      <div className="max-w-md mx-auto px-4 py-4 pb-24">
+        <div className="flex gap-3 mb-6">
+          <button onClick={() => { setSelFolder(null); setShowMapModal(true); }}
+            className="flex-1 bg-gradient-to-r from-mint to-accent text-white py-3 px-4 rounded-xl font-medium hover:opacity-90 active:scale-95 transition-all shadow-lg shadow-mint/20">
+            + 新建思维导图
+          </button>
+          <button onClick={() => setShowFolderModal(true)}
+            className="bg-secondary text-white py-3 px-4 rounded-xl font-medium hover:bg-secondary/80 active:scale-95 transition-all">
+            📁+ 文件夹
+          </button>
+        </div>
+
+        {folders.length > 0 && folders.map(folder => {
+          const maps = mindmaps.filter(m => m.folder_id === folder.id);
+          const isExp = expanded.has(folder.id);
+          return (
+            <div key={folder.id} className="bg-secondary/50 rounded-xl overflow-hidden mb-3 animate-fade-in">
+              <div className="flex items-center justify-between p-3 cursor-pointer hover:bg-secondary/80 transition-colors"
+                onClick={() => toggleFolder(folder.id)}>
+                <div className="flex items-center gap-2 min-w-0 flex-1">
+                  <span className="text-lg">{isExp ? '📂' : '📁'}</span>
+                  {editingFolder === folder.id ? (
+                    <input value={editName} autoFocus
+                      onChange={e => setEditName(e.target.value)}
+                      onBlur={() => renameFolder(folder)}
+                      onKeyDown={e => { if (e.key === 'Enter') renameFolder(folder); e.stopPropagation(); }}
+                      onClick={e => e.stopPropagation()}
+                      className="bg-primary px-2 py-1 rounded text-sm flex-1 min-w-0 outline-none ring-1 ring-mint" />
+                  ) : (
+                    <span className="font-medium truncate">{folder.name}</span>
+                  )}
+                  <span className="text-xs text-gray-400 flex-shrink-0">({maps.length})</span>
+                </div>
+                <div className="flex items-center gap-1 flex-shrink-0">
+                  <button onClick={e => { e.stopPropagation(); renameFolder(folder); }}
+                    className="text-gray-400 hover:text-mint px-2 py-1 text-xs no-drag">✏️</button>
+                  <button onClick={e => { e.stopPropagation(); deleteFolder(folder.id); }}
+                    className="text-gray-400 hover:text-accent px-2 py-1 text-xs no-drag">🗑️</button>
+                  <button onClick={e => { e.stopPropagation(); setSelFolder(folder.id); setShowMapModal(true); }}
+                    className="text-mint hover:text-accent px-2 py-1 text-xs font-medium no-drag">+ 新建</button>
+                </div>
+              </div>
+              {isExp && (
+                <div className="p-3 pt-0 space-y-2">
+                  {maps.length === 0 ? (
+                    <p className="text-sm text-gray-500 text-center py-4">文件夹为空</p>
+                  ) : maps.map(map => (
+                    <button key={map.id} onClick={() => onOpen(map.id)}
+                      className="block w-full text-left bg-primary/80 rounded-lg p-3 hover:bg-primary transition-colors animate-fade-in">
+                      <p className="font-medium truncate">{map.title || '未命名'}</p>
+                      <p className="text-xs text-gray-400 mt-1">{(map.nodes?.length || 0)} 个节点</p>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          );
+        })}
+
+        <div className="mb-4">
+          <h2 className="text-sm font-medium text-gray-300 mb-3 px-1">
+            {folders.length > 0 ? '未分类' : '全部思维导图'} ({uncategorized.length})
+          </h2>
+          {uncategorized.length === 0 ? (
+            <div className="bg-secondary/30 rounded-xl p-8 text-center">
+              <div className="text-4xl mb-2">🧠</div>
+              <p className="text-gray-400 text-sm">还没有思维导图</p>
+              <p className="text-gray-500 text-xs mt-1">点击上方按钮开始创建</p>
+            </div>
+          ) : (
+            <div className="space-y-2">
+              {uncategorized.map(map => (
+                <button key={map.id} onClick={() => onOpen(map.id)}
+                  className="block w-full text-left bg-secondary/50 rounded-xl p-4 hover:bg-secondary/80 transition-colors animate-fade-in">
+                  <p className="font-medium truncate">{map.title || '未命名'}</p>
+                  <p className="text-xs text-gray-400 mt-1">{(map.nodes?.length || 0)} 个节点</p>
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Folder Modal */}
+      {showFolderModal && (
+        <div className="fixed inset-0 bg-black/60 flex items-end justify-center z-50 animate-fade-in" onClick={() => setShowFolderModal(false)}>
+          <div className="bg-primary w-full max-w-md rounded-t-2xl p-5 animate-slide-up" onClick={e => e.stopPropagation()}>
+            <div className="w-12 h-1 bg-gray-600 rounded-full mx-auto mb-4" />
+            <h3 className="font-bold text-lg mb-4">新建文件夹</h3>
+            <input autoFocus type="text" value={newName}
+              onChange={e => setNewName(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter') createFolder(); e.stopPropagation(); }}
+              placeholder="文件夹名称"
+              className="w-full bg-secondary px-4 py-3 rounded-xl outline-none focus:ring-2 focus:ring-mint mb-4"
+              onClick={e => e.stopPropagation()} />
+            <div className="flex gap-2">
+              <button onClick={() => setShowFolderModal(false)} className="flex-1 py-3 bg-secondary rounded-xl font-medium">取消</button>
+              <button onClick={createFolder} className="flex-1 py-3 bg-gradient-to-r from-mint to-accent rounded-xl font-medium">创建</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Mindmap Modal */}
+      {showMapModal && (
+        <div className="fixed inset-0 bg-black/60 flex items-end justify-center z-50 animate-fade-in" onClick={() => setShowMapModal(false)}>
+          <div className="bg-primary w-full max-w-md rounded-t-2xl p-5 animate-slide-up" onClick={e => e.stopPropagation()}>
+            <div className="w-12 h-1 bg-gray-600 rounded-full mx-auto mb-4" />
+            <h3 className="font-bold text-lg mb-4">{selFolder ? '在文件夹中新建' : '新建思维导图'}</h3>
+            <input autoFocus type="text" value={newName}
+              onChange={e => setNewName(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter') createMindmap(); e.stopPropagation(); }}
+              placeholder="思维导图标题"
+              className="w-full bg-secondary px-4 py-3 rounded-xl outline-none focus:ring-2 focus:ring-mint mb-4"
+              onClick={e => e.stopPropagation()} />
+            {!selFolder && folders.length > 0 && (
+              <div className="mb-4">
+                <p className="text-xs text-gray-400 mb-2">选择文件夹（可选）：</p>
+                <div className="flex flex-wrap gap-2">
+                  <button onClick={() => setSelFolder(null)}
+                    className={`px-3 py-2 rounded-lg text-sm ${selFolder === null ? 'bg-mint/20 text-mint ring-1 ring-mint' : 'bg-secondary'}`}>
+                    未分类
+                  </button>
+                  {folders.map(f => (
+                    <button key={f.id} onClick={() => setSelFolder(f.id)}
+                      className={`px-3 py-2 rounded-lg text-sm ${selFolder === f.id ? 'bg-mint/20 text-mint ring-1 ring-mint' : 'bg-secondary'}`}>
+                      📁 {f.name}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+            <div className="flex gap-2">
+              <button onClick={() => { setShowMapModal(false); setSelFolder(null); }}
+                className="flex-1 py-3 bg-secondary rounded-xl font-medium">取消</button>
+              <button onClick={createMindmap}
+                className="flex-1 py-3 bg-gradient-to-r from-mint to-accent rounded-xl font-medium">创建</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function App() {
+  const [view, setView] = useState('home');
+  const [currentId, setCurrentId] = useState(null);
+
+  if (view === 'editor' && currentId) {
+    return <EditorPage id={currentId} onBack={() => { setView('home'); setCurrentId(null); }} />;
+  }
+
+  return <HomePage onOpen={(id) => { setCurrentId(id); setView('editor'); }} />;
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
